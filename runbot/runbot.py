@@ -1225,7 +1225,13 @@ class RunbotController(http.Controller):
                 }
 
             context.update({
-                'branches': [branch_info(b) for b in branches],
+                'branches': [
+                    branch_info(b) for b in
+                    sorted(
+                        branches,
+                        lambda x, y: cmp(x.name, y.name)
+                        if x.sticky == y.sticky else -1 if x.sticky else 1)
+                ],
                 'testing': count([('repo_id','=',repo.id), ('state','=','testing')]),
                 'running': count([('repo_id','=',repo.id), ('state','=','running')]),
                 'pending': count([('repo_id','=',repo.id), ('state','=','pending')]),
