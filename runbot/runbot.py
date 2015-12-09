@@ -565,6 +565,7 @@ class runbot_build(osv.osv):
             extra_info.update({'state': 'duplicate', 'duplicate_id': duplicate_ids[0]})
             self.write(cr, uid, [duplicate_ids[0]], {'duplicate_id': build_id})
         self.write(cr, uid, [build_id], extra_info, context=context)
+        return build_id
 
     def reset(self, cr, uid, ids, context=None):
         self.write(cr, uid, ids, { 'state' : 'pending' }, context=context)
