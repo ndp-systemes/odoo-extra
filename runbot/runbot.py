@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib
 from collections import OrderedDict
 
 import dateutil.parser
@@ -1323,7 +1324,7 @@ class RunbotController(http.Controller):
             'author': build.author,
             'committer': build.committer,
             'dest': build.dest,
-            'real_dest': real_build.dest,
+            'real_dest': urllib.quote_plus(real_build.dest),
             'job_age': s2human(real_build.job_age),
             'job_time': s2human(real_build.job_time),
             'job': real_build.job,
