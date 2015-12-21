@@ -1175,7 +1175,7 @@ class RunbotController(http.Controller):
                 domain += ['|', '|', ('dest', 'ilike', search), ('subject', 'ilike', search), ('branch_id.branch_name', 'ilike', search)]
 
             build_ids = build_obj.search(cr, uid, domain, limit=int(limit))
-            branch_ids, build_by_branch_ids = [], {}
+            build_by_branch_ids = {}
 
             if build_ids:
                 branch_query = """
@@ -1215,7 +1215,7 @@ class RunbotController(http.Controller):
                     rec[0]: [r for r in rec[1:] if r is not None] for rec in cr.fetchall()
                 }
 
-            branches = branch_obj.browse(cr, uid, branch_ids, context=request.context)
+            branches = branch_obj.browse(cr, uid, build_by_branch_ids.keys(), context=request.context)
             build_ids = flatten(build_by_branch_ids.values())
             build_dict = {build.id: build for build in build_obj.browse(cr, uid, build_ids, context=request.context) }
 
@@ -1226,7 +1226,13 @@ class RunbotController(http.Controller):
                 }
 
             context.update({
-                'branches': [branch_info(b) for b in branches],
+                'branches': [
+                    branch_info(b) for b in
+                    sorted(
+                        branches,
+                        lambda x, y: cmp(x.name, y.name)
+                        if x.sticky == y.sticky else -1 if x.sticky else 1)
+                ],
                 'testing': count([('repo_id','=',repo.id), ('state','=','testing')]),
                 'running': count([('repo_id','=',repo.id), ('state','=','running')]),
                 'pending': count([('repo_id','=',repo.id), ('state','=','pending')]),
