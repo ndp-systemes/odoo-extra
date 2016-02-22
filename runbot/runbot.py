@@ -1,5 +1,6 @@
 # -*- encoding: utf-8 -*-
 
+import contextlib
 import datetime
 import fcntl
 import glob
@@ -8,6 +9,7 @@ import itertools
 import logging
 import operator
 import os
+import psycopg2
 import re
 import resource
 import shutil
@@ -152,6 +154,16 @@ def uniq_list(l):
 
 def fqdn():
     return socket.getfqdn()
+
+@contextlib.contextmanager
+def local_pgadmin_cursor():
+    cnx = None
+    try:
+        cnx = psycopg2.connect("dbname=postgres")
+        cnx.autocommit = True # required for admin commands
+        yield cnx.cursor()
+    finally:
+        if cnx: cnx.close()
 
 #----------------------------------------------------------
 # RunBot Models
@@ -407,7 +419,13 @@ class runbot_repo(osv.osv):
                 os.kill(pid, signal.SIGHUP)
             except Exception:
                 _logger.debug('start nginx')
-                run(['/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf'])
+                if run(['/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf']):
+                    # obscure nginx bug leaving orphan worker listening on nginx port
+                    if not run(['pkill', '-f', '-P1', 'nginx: worker']):
+                        _logger.debug('failed to start nginx - orphan worker killed, retrying')
+                        run(['/usr/sbin/nginx', '-p', nginx_dir, '-c', 'nginx.conf'])
+                    else:
+                        _logger.debug('failed to start nginx - failed to kill orphan worker - oh well')
 
     def killall(self, cr, uid, ids=None, context=None):
         # kill switch
@@ -513,7 +531,18 @@ class runbot_build(osv.osv):
 
     _columns = {
         'branch_id': fields.many2one('runbot.branch', 'Branch', required=True, ondelete='cascade', select=1),
-        'repo_id': fields.related('branch_id', 'repo_id', type="many2one", relation="runbot.repo", string="Repository", readonly=True, store=True, ondelete='cascade', select=1),
+        'repo_id': fields.related(
+            'branch_id', 'repo_id', type="many2one", relation="runbot.repo",
+            string="Repository", readonly=True, ondelete='cascade', select=1,
+            store={
+                'runbot.build': (lambda s, c, u, ids, ctx: ids, ['branch_id'], 20),
+                'runbot.branch': (
+                    lambda self, cr, uid, ids, ctx: self.pool['runbot.build'].search(
+                        cr, uid, [('branch_id', 'in', ids)]),
+                    ['repo_id'],
+                    10,
+                ),
+            }),
         'name': fields.char('Revno', required=True, select=1),
         'host': fields.char('Host'),
         'port': fields.integer('Port'),
@@ -756,6 +785,10 @@ class runbot_build(osv.osv):
                 for extra_repo in build.repo_id.dependency_ids:
                     repo_id, closest_name, server_match = build._get_closest_branch_name(extra_repo.id)
                     repo = self.pool['runbot.repo'].browse(cr, uid, repo_id, context=context)
+                    build._log(
+                        'Building environment',
+                        '%s match branch %s of %s' % (server_match, closest_name, repo.name)
+                    )
                     repo.git_export(closest_name, build.path())
 
                 # Finally mark all addons to move to openerp/addons
@@ -788,17 +821,19 @@ class runbot_build(osv.osv):
             build.write({'server_match': server_match,
                          'modules': ','.join(modules_to_test)})
 
-    def pg_dropdb(self, cr, uid, dbname):
-        run(['dropdb', dbname])
+    def _local_pg_dropdb(self, cr, uid, dbname):
+        with local_pgadmin_cursor() as local_cr:
+            local_cr.execute('DROP DATABASE IF EXISTS "%s"' % dbname)
         # cleanup filestore
         datadir = appdirs.user_data_dir()
         paths = [os.path.join(datadir, pn, 'filestore', dbname) for pn in 'OpenERP Odoo'.split()]
         run(['rm', '-rf'] + paths)
 
-    def pg_createdb(self, cr, uid, dbname):
-        self.pg_dropdb(cr, uid, dbname)
+    def _local_pg_createdb(self, cr, uid, dbname):
+        self._local_pg_dropdb(cr, uid, dbname)
         _logger.debug("createdb %s", dbname)
-        run(['createdb', '--encoding=unicode', '--lc-collate=C', '--template=template0', dbname])
+        with local_pgadmin_cursor() as local_cr:
+            local_cr.execute("""CREATE DATABASE "%s" TEMPLATE template0 LC_COLLATE 'C' ENCODING 'unicode'""" % dbname)
 
     def cmd(self, cr, uid, ids, context=None):
         """Return a list describing the command to start the build"""
@@ -897,7 +932,7 @@ class runbot_build(osv.osv):
     def job_10_test_base(self, cr, uid, build, lock_path, log_path):
         build._log('test_base', 'Start test base module')
         # run base test
-        self.pg_createdb(cr, uid, "%s-base" % build.dest)
+        self._local_pg_createdb(cr, uid, "%s-base" % build.dest)
         cmd, mods = build.cmd()
         if grep(build.server("tools/config.py"), "test-enable"):
             cmd.append("--test-enable")
@@ -906,7 +941,7 @@ class runbot_build(osv.osv):
 
     def job_20_test_all(self, cr, uid, build, lock_path, log_path):
         build._log('test_all', 'Start test all modules')
-        self.pg_createdb(cr, uid, "%s-all" % build.dest)
+        self._local_pg_createdb(cr, uid, "%s-all" % build.dest)
         cmd, mods = build.cmd()
         if grep(build.server("tools/config.py"), "test-enable"):
             cmd.append("--test-enable")
@@ -1026,6 +1061,7 @@ class runbot_build(osv.osv):
                     timeout = (build.branch_id.job_timeout or default_timeout) * 60
                     if build.job != jobs[-1] and build.job_time > timeout:
                         build.logger('%s time exceded (%ss)', build.job, build.job_time)
+                        build.write({'job_end': now()})
                         build.kill(result='killed')
                     continue
                 build.logger('%s finished', build.job)
@@ -1066,7 +1102,7 @@ class runbot_build(osv.osv):
 
             # cleanup only needed if it was not killed
             if build.state == 'done':
-                build.cleanup()
+                build._local_cleanup()
 
     def skip(self, cr, uid, ids, context=None):
         self.write(cr, uid, ids, {'state': 'done', 'result': 'skipped'}, context=context)
@@ -1074,19 +1110,36 @@ class runbot_build(osv.osv):
         if len(to_unduplicate):
             self.force(cr, uid, to_unduplicate, context=context)
 
-    def cleanup(self, cr, uid, ids, context=None):
+    def _local_cleanup(self, cr, uid, ids, context=None):
         for build in self.browse(cr, uid, ids, context=context):
-            cr.execute("""
-                SELECT datname
-                  FROM pg_database
-                 WHERE pg_get_userbyid(datdba) = current_user
-                   AND datname LIKE %s
-            """, [build.dest + '%'])
-            for db, in cr.fetchall():
-                self.pg_dropdb(cr, uid, db)
+            # Cleanup the *local* cluster
+            with local_pgadmin_cursor() as local_cr:
+                local_cr.execute("""
+                    SELECT datname
+                      FROM pg_database
+                     WHERE pg_get_userbyid(datdba) = current_user
+                       AND datname LIKE %s
+                """, [build.dest + '%'])
+                to_delete = local_cr.fetchall()
+            for db, in to_delete:
+                self._local_pg_dropdb(cr, uid, db)
 
-            if os.path.isdir(build.path()) and build.result != 'killed':
-                shutil.rmtree(build.path())
+        # cleanup: find any build older than 7 days.
+        root = self.pool['runbot.repo'].root(cr, uid)
+        build_dir = os.path.join(root, 'build')
+        builds = os.listdir(build_dir)
+        cr.execute("""
+            SELECT dest
+              FROM runbot_build
+             WHERE dest IN %s
+               AND (state != 'done' OR job_end > (now() - interval '7 days'))
+        """, [tuple(builds)])
+        actives = set(b[0] for b in cr.fetchall())
+
+        for b in builds:
+            path = os.path.join(build_dir, b)
+            if b not in actives and os.path.isdir(path):
+                shutil.rmtree(path)
 
     def kill(self, cr, uid, ids, result=None, context=None):
         for build in self.browse(cr, uid, ids, context=context):
@@ -1102,7 +1155,7 @@ class runbot_build(osv.osv):
             build.write(v)
             cr.commit()
             build.github_status()
-            build.cleanup()
+            build._local_cleanup()
 
     def reap(self, cr, uid, ids):
         while True:
@@ -1169,6 +1222,7 @@ class RunbotController(http.Controller):
             'refresh': refresh,
         }
 
+        build_ids = []
         if repo:
             filters = {key: post.get(key, '1') for key in ['pending', 'testing', 'running', 'done']}
             domain = [('repo_id','=',repo.id)]
@@ -1242,7 +1296,10 @@ class RunbotController(http.Controller):
                 'filters': filters,
             })
 
-        for result in build_obj.read_group(cr, uid, [], ['host'], ['host']):
+        # consider host gone if no build in last 100
+        build_threshold = max(build_ids or [0]) - 100
+
+        for result in build_obj.read_group(cr, uid, [('id', '>', build_threshold)], ['host'], ['host']):
             if result['host']:
                 context['host_stats'].append({
                     'host': result['host'],
@@ -1303,7 +1360,9 @@ class RunbotController(http.Controller):
             b = r['branches'].setdefault(branch.id, {'name': branch.branch_name, 'builds': list()})
             b['builds'].append(self.build_info(build))
 
-        for result in RB.read_group([], ['host'], ['host']):
+        # consider host gone if no build in last 100
+        build_threshold = max(builds.ids or [0]) - 100
+        for result in RB.read_group([('id', '>', build_threshold)], ['host'], ['host']):
             if result['host']:
                 qctx['host_stats'].append({
                     'host': result['host'],
